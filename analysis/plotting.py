@@ -5,7 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from collections import defaultdict
 from pathlib import Path
-from diversity import diversity_score
+from analysis.diversity import diversity_score
 
 def load_metrics(rollouts_path: str) -> dict:
     """Reconstruct per-round metrics from jsonl log."""
