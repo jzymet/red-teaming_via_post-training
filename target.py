@@ -8,7 +8,7 @@ class TargetClient:
     No Ollama needed — runs directly on GPU.
     Sometimes refuses — that's the behavior we measure.
     """
-    def __init__(self, model_name: str = "meta-llama/Llama-3.2-3B-Instruct"):
+    def __init__(self, model_name: str = "meta-llama/Llama-3.2-1B-Instruct"):
         self.pipe = pipeline(
             "text-generation",
             model=model_name,
