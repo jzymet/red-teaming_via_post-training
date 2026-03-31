@@ -1,3 +1,4 @@
+import os
 import asyncio
 import json
 import torch
@@ -106,13 +107,20 @@ async def training_loop(rank: int, world_size: int, config: dict):
 
 # ── entry point ───────────────────────────────────────────────────────────────
 
+def _worker(rank: int, world_size: int, config: dict):
+    asyncio.run(training_loop(rank, world_size, config))
+
 def main():
+    # set distributed env vars before spawning
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"  # any free port
+
     config     = load_config()
     world_size = torch.cuda.device_count()
     print(f"launching on {world_size} GPUs")
 
     spawn(
-        fn=lambda rank, ws, cfg: asyncio.run(training_loop(rank, ws, cfg)),
+        fn=_worker,
         args=(world_size, config),
         nprocs=world_size,
         join=True
