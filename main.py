@@ -101,7 +101,10 @@ async def training_loop(rank: int, world_size: int, config: dict):
             log_metrics(metrics, round_idx)
 
     if rank == 0:
-        plot_collapse(config["output_path"])
+        if os.path.exists(config["output_path"]):
+            plot_collapse(config["output_path"])
+        else:
+            print("No rollouts written — skipping plot")
 
     dist.destroy_process_group()
 
@@ -111,13 +114,12 @@ def _worker(rank: int, world_size: int, config: dict):
     asyncio.run(training_loop(rank, world_size, config))
 
 def main():
-    # set distributed env vars before spawning
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"  # any free port
-
+    os.environ["MASTER_PORT"] = "12355"
+    
     config     = load_config()
-    world_size = torch.cuda.device_count()
-    print(f"launching on {world_size} GPUs")
+    world_size = 1  # force single GPU for debugging
+    print(f"launching on {world_size} GPU")
 
     spawn(
         fn=_worker,
