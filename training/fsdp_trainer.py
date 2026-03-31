@@ -30,12 +30,12 @@ class FSDPTrainer:
         # fsdp_trainer.py — wrap only for training, leave _raw_model alone
         self.model = FSDP(
             attacker.model,
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
             device_id=0
         )
         # attacker._raw_model still points to original unwrapped model
         # attacker.model now points to FSDP wrapper
-        
+
         self.tokenizer = attacker.tokenizer
         self.optimizer = torch.optim.Adam(
             self.model.parameters(), lr=lr
