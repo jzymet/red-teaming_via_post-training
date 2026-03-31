@@ -57,16 +57,20 @@ class FSDPTrainer:
     def generate_rollout_inputs(self, n: int) -> list[AttackerOutput]:
         """
         Generate n attacker outputs using the current policy.
-        Must be called on rank 0 only. Uses summon_full_params to
-        unshard the model for generation.
+
+        MUST be called on ALL ranks — summon_full_params is a collective
+        op (all-gather) that requires every rank to participate.
+        Only rank 0 actually generates; rank 1 just participates in
+        the collective and returns [].
         """
         outputs = []
         with FSDP.summon_full_params(self.model, writeback=False):
-            for _ in range(n):
-                out = self.attacker.generate_sync(
-                    device=torch.device(f"cuda:{self.rank}")
-                )
-                outputs.append(out)
+            if self.rank == 0:
+                for _ in range(n):
+                    out = self.attacker.generate_sync(
+                        device=torch.device(f"cuda:{self.rank}")
+                    )
+                    outputs.append(out)
         return outputs
 
     def _broadcast_rollout_data(self, rollouts: list[Rollout]) -> PPOBatch:
