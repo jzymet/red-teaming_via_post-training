@@ -34,9 +34,10 @@ class AttackerModel:
         return await loop.run_in_executor(None, self._generate_sync)
 
     def _generate_sync(self) -> AttackerOutput:
+        device = next(self.model.parameters()).device  # wherever model actually is
         inputs = self.tokenizer(
             SYSTEM_PROMPT, return_tensors="pt"
-        )  # no .to() — model is on CPU
+        ).to(device)  # move inputs to match model
 
         with torch.no_grad():
             output = self.model.generate(
