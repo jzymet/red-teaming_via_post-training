@@ -24,6 +24,7 @@ class EvaluatorClient:
                     prompt:   str,
                     response: str,
                     session:  aiohttp.ClientSession) -> float:
+        
         payload = {
             "model": self.model_name,
             "messages": [
@@ -41,6 +42,11 @@ class EvaluatorClient:
             headers=headers
         ) as resp:
             data = await resp.json()
+
+        # debug — print full response if unexpected structure
+        if "choices" not in data:
+            print(f"unexpected groq response: {data}")
+            return 0.0  # fail gracefully instead of raising
 
         raw = data["choices"][0]["message"]["content"].strip()
 
