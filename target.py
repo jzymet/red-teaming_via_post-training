@@ -13,7 +13,7 @@ class TargetClient:
             "text-generation",
             model=model_name,
             torch_dtype=torch.bfloat16,
-            device_map="auto"
+            device_map={"": 1}  # pin to GPU 1
         )
 
     async def respond(self,

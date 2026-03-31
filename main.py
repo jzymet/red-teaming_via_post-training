@@ -118,7 +118,7 @@ def main():
     os.environ["MASTER_PORT"] = "12355"
     
     config     = load_config()
-    world_size = 1  # force single GPU for debugging
+    world_size = torch.cuda.device_count() 
     print(f"launching on {world_size} GPU")
 
     spawn(
