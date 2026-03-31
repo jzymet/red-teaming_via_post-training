@@ -4,6 +4,7 @@ import asyncio
 import aiohttp
 from dataclasses import dataclass
 import torch
+import traceback
 from attacker import AttackerModel, AttackerOutput
 from target import TargetClient
 from evaluator import EvaluatorClient
@@ -48,7 +49,11 @@ async def collect_rollouts(attacker:       AttackerModel,
         tasks   = [guarded_rollout(session) for _ in range(n)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            print(f"rollout {i} failed: {type(r).__name__}: {r}")
+            traceback.print_exception(type(r), r, r.__traceback__)
+
     good = [r for r in results if isinstance(r, Rollout)]
-    if len(good) < n:
-        print(f"warning: {n - len(good)} rollouts failed")
+    print(f"{len(good)}/{len(results)} rollouts succeeded")
     return good

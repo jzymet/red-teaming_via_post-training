@@ -31,7 +31,9 @@ class TargetClient:
             max_new_tokens=128,
             do_sample=True,
             temperature=0.7,
-            pad_token_id=self.pipe.tokenizer.eos_token_id
+            pad_token_id=self.pipe.tokenizer.eos_token_id,
+            truncation=True,        # add this
+            max_length=512          # add this — overrides the model's default 20
         )
         # pipeline returns full text including prompt — strip it
         return result[0]["generated_text"][len(prompt):]
