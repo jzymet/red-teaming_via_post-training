@@ -21,7 +21,7 @@ def load_config(path: str = "config.json") -> dict:
     defaults = {
         "attacker_model":     "Qwen/Qwen2.5-1.5B",
         "target_model":       "meta-llama/Llama-3.2-3B-Instruct",
-        "evaluator_model":    "llama3-8b-8192",
+        "evaluator_model":    "llama-3.1-8b-instant",
         "groq_api_key":       "YOUR_GROQ_API_KEY",
         "num_rounds":         50,
         "rollouts_per_round": 8,

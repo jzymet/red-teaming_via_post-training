@@ -54,25 +54,20 @@ class FSDPTrainer:
         )
 
     def _compute_new_logprobs(self, batch: PPOBatch) -> torch.Tensor:
-        """Forward pass through updated policy to get new log probs."""
         inputs = self.tokenizer(
             batch.prompts,
             return_tensors="pt",
             padding=True
         ).to(self.rank)
 
-        output = self.model(
-            **inputs,
-            return_dict_in_generate=True,
-            output_scores=True
-        )
+        output = self.model(**inputs)  # forward pass → logits, not scores
 
-        all_scores   = torch.stack(output.scores, dim=1)  # [batch, seq_len, vocab]
-        log_probs    = F.log_softmax(all_scores, dim=-1)
+        # output.logits is [batch, seq_len, vocab_size] directly
+        log_probs    = F.log_softmax(output.logits, dim=-1)
         new_logprobs = log_probs.gather(
             dim=-1,
             index=inputs["input_ids"].unsqueeze(-1)
-        ).squeeze(-1)                                      # [batch, seq_len]
+        ).squeeze(-1)                                    # [batch, seq_len]
 
         return new_logprobs
 
