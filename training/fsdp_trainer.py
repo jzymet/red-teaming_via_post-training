@@ -13,10 +13,6 @@ class PPOBatch:
     scores:   torch.Tensor  # [batch]
 
 class FSDPTrainer:
-    """
-    Wraps attacker in FSDP and runs PPO updates.
-    Designed for 2-GPU setup on Kaggle/Colab.
-    """
     def __init__(self,
                  attacker:  AttackerModel,
                  rank:      int,
@@ -26,23 +22,19 @@ class FSDPTrainer:
         self.rank     = rank
         self.clip_eps = clip_eps
         self.beta     = beta
+        self.attacker = attacker  # keep reference for weight sync
 
-        # fsdp_trainer.py — wrap only for training, leave _raw_model alone
         self.model = FSDP(
             attacker.model,
             sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-            device_id=0
+            device_id=torch.device(f"cuda:{rank}"),
         )
-        # attacker._raw_model still points to original unwrapped model
-        # attacker.model now points to FSDP wrapper
-
         self.tokenizer = attacker.tokenizer
         self.optimizer = torch.optim.Adam(
             self.model.parameters(), lr=lr
         )
 
     def _rollouts_to_batch(self, rollouts: list[Rollout]) -> PPOBatch:
-        """Collate rollouts into tensors, padding logprobs to same length."""
         max_len = max(r.logprobs.shape[0] for r in rollouts)
         padded  = [
             F.pad(r.logprobs, (0, max_len - r.logprobs.shape[0]))
@@ -64,14 +56,12 @@ class FSDPTrainer:
             padding=True
         ).to(self.rank)
 
-        output = self.model(**inputs)  # forward pass → logits, not scores
-
-        # output.logits is [batch, seq_len, vocab_size] directly
-        log_probs    = F.log_softmax(output.logits, dim=-1)
+        output   = self.model(**inputs)
+        log_probs = F.log_softmax(output.logits, dim=-1)
         new_logprobs = log_probs.gather(
             dim=-1,
             index=inputs["input_ids"].unsqueeze(-1)
-        ).squeeze(-1)                                    # [batch, seq_len]
+        ).squeeze(-1)                                   # [batch, seq_len]
 
         return new_logprobs
 
@@ -79,7 +69,6 @@ class FSDPTrainer:
                   new_logprobs: torch.Tensor,
                   old_logprobs: torch.Tensor,
                   advantages:   torch.Tensor) -> torch.Tensor:
-        """Clipped PPO loss + KL penalty."""
         new_seq = new_logprobs.sum(dim=-1)  # [batch]
         old_seq = old_logprobs.sum(dim=-1)  # [batch]
 
@@ -97,13 +86,11 @@ class FSDPTrainer:
     def step(self, rollouts: list[Rollout]):
         torch.cuda.empty_cache()
 
-        # rank 1 has no rollouts — create dummy batch for FSDP sync
+        # rank 1 has no rollouts — dummy forward for FSDP sync
         if not rollouts:
-            # still need to participate in FSDP collective ops
-            # run a minimal forward/backward with zeros
-            dummy = torch.zeros(1, 1, dtype=torch.long).cuda(self.rank)
+            dummy  = torch.zeros(1, 1, dtype=torch.long).cuda(self.rank)
             output = self.model(dummy)
-            loss   = output.logits.sum() * 0.0  # zero loss, just for FSDP sync
+            loss   = output.logits.sum() * 0.0
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
@@ -118,7 +105,12 @@ class FSDPTrainer:
         loss.backward()
         self.optimizer.step()
 
+        # sync CPU attacker model with updated FSDP weights
+        # so next round's generation uses the latest policy
         if self.rank == 0:
+            self.attacker.load_state_dict(
+                {k: v.cpu() for k, v in self.model.state_dict().items()}
+            )
             print(
                 f"loss: {loss.item():.4f} | "
                 f"mean reward: {batch.scores.mean().item():.4f}"

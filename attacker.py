@@ -23,24 +23,23 @@ class AttackerModel:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model     = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.bfloat16
+            torch_dtype=torch.bfloat16,
+            device_map="cpu"   # load to CPU — FSDP moves to GPU, generation stays CPU
         )
         self.model.eval()
-        self._raw_model = self.model  # keep unwrapped reference for generate()
 
     async def generate(self) -> AttackerOutput:
-        """Async wrapper — offloads GPU compute to executor."""
+        """Async wrapper — offloads CPU compute to executor."""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self._generate_sync)
 
     def _generate_sync(self) -> AttackerOutput:
-        # always use raw unwrapped model for generation
         inputs = self.tokenizer(
             SYSTEM_PROMPT, return_tensors="pt"
-        ).to(self._raw_model.device)
+        )  # no .to() — model is on CPU
 
         with torch.no_grad():
-            output = self._raw_model.generate(
+            output = self.model.generate(
                 **inputs,
                 max_new_tokens=128,
                 do_sample=True,
@@ -57,11 +56,11 @@ class AttackerModel:
         )
 
         # vectorized log prob extraction via gather
-        all_scores   = torch.cat(
+        all_scores = torch.cat(
             [score for score in output.scores], dim=0
         )                                               # [seq_len, vocab_size]
-        log_probs    = F.log_softmax(all_scores, dim=-1)
-        logprobs     = log_probs.gather(
+        log_probs  = F.log_softmax(all_scores, dim=-1)
+        logprobs   = log_probs.gather(
             dim=-1,
             index=generated_ids.unsqueeze(-1)
         ).squeeze(-1)                                   # [seq_len]
