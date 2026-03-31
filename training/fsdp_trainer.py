@@ -30,7 +30,7 @@ class FSDPTrainer:
         self.model = FSDP(
             attacker.model,
             sharding_strategy=ShardingStrategy.FULL_SHARD,
-            device_id=rank
+            device_id=0
         )
         self.tokenizer = attacker.tokenizer
         self.optimizer = torch.optim.Adam(
