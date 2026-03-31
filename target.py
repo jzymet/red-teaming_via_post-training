@@ -1,39 +1,48 @@
-import asyncio
-import torch
-from transformers import pipeline
+"""
+target.py — Groq-hosted LLM as the target model.
+
+Using Groq for the target (instead of a local HuggingFace model) means:
+  - Both GPUs are free for FSDP on the attacker
+  - Rollout collection is truly async (HTTP calls, not GPU compute)
+  - No memory pressure from loading a second model
+"""
+
+import aiohttp
+
 
 class TargetClient:
-    """
-    HuggingFace-hosted safety-finetuned model as target.
-    No Ollama needed — runs directly on GPU.
-    Sometimes refuses — that's the behavior we measure.
-    """
-    def __init__(self, model_name: str = "meta-llama/Llama-3.2-1B-Instruct"):
-        self.pipe = pipeline(
-            "text-generation",
-            model=model_name,
-            torch_dtype=torch.bfloat16,
-            device_map={"": 1}  # pin to GPU 1
-        )
+    def __init__(
+        self,
+        api_key: str,
+        model_name: str = "llama-3.1-8b-instant",
+        base_url: str = "https://api.groq.com/openai/v1/chat/completions",
+    ):
+        self.api_key = api_key
+        self.model_name = model_name
+        self.base_url = base_url
 
-    async def respond(self,
-                      prompt: str,
-                      session=None) -> str:          # session kept for API compatibility
-        """Async wrapper — offloads GPU compute to executor."""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, self._respond_sync, prompt
-        )
+    async def respond(
+        self,
+        prompt: str,
+        session: aiohttp.ClientSession,
+    ) -> str:
+        payload = {
+            "model": self.model_name,
+            "messages": [
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.7,
+            "max_tokens": 128,
+        }
+        headers = {"Authorization": f"Bearer {self.api_key}"}
 
-    def _respond_sync(self, prompt: str) -> str:
-        result = self.pipe(
-            prompt,
-            max_new_tokens=128,
-            do_sample=True,
-            temperature=0.7,
-            pad_token_id=self.pipe.tokenizer.eos_token_id,
-            truncation=True,        # add this
-            max_length=512          # add this — overrides the model's default 20
-        )
-        # pipeline returns full text including prompt — strip it
-        return result[0]["generated_text"][len(prompt):]
+        async with session.post(
+            self.base_url, json=payload, headers=headers
+        ) as resp:
+            data = await resp.json()
+
+        if "choices" not in data:
+            print(f"unexpected groq response: {data}")
+            return "[target error]"
+
+        return data["choices"][0]["message"]["content"].strip()
