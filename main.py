@@ -1,6 +1,6 @@
-import os
 import asyncio
 import json
+import os
 import torch
 import torch.distributed as dist
 from torch.multiprocessing.spawn import spawn
@@ -14,10 +14,7 @@ from training.fsdp_trainer import FSDPTrainer
 from analysis.diversity import diversity_score
 from analysis.plotting import plot_collapse
 
-# ── config ────────────────────────────────────────────────────────────────────
-
 def load_config(path: str = "config.json") -> dict:
-    """Load from config.json if present, else use defaults."""
     defaults = {
         "attacker_model":     "Qwen/Qwen2.5-1.5B",
         "target_model":       "meta-llama/Llama-3.2-3B-Instruct",
@@ -33,12 +30,10 @@ def load_config(path: str = "config.json") -> dict:
         with open(path) as f:
             overrides = json.load(f)
         defaults.update(overrides)
-        print(f"loaded config from {path}")
+        print(f"loaded config from: {os.path.abspath(path)}")
     else:
         print("no config.json found, using defaults")
     return defaults
-
-# ── logging ───────────────────────────────────────────────────────────────────
 
 def log_rollouts(rollouts, round_idx: int, path: str):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -63,37 +58,48 @@ def log_metrics(metrics: dict, round_idx: int):
         f"diversity {metrics['diversity']:.3f}"
     )
 
-# ── training loop ─────────────────────────────────────────────────────────────
-
 async def training_loop(rank: int, world_size: int, config: dict):
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
-    attacker  = AttackerModel(config["attacker_model"])
-    target    = TargetClient(config["target_model"])
-    evaluator = EvaluatorClient(
-        api_key=config["groq_api_key"],
-        model_name=config["evaluator_model"]
-    )
-    trainer = FSDPTrainer(attacker, rank=rank)
+    # both ranks load attacker — FSDP wraps on both
+    attacker = AttackerModel(config["attacker_model"])
+    trainer  = FSDPTrainer(attacker, rank=rank)
+
+    # only rank 0 needs target and evaluator
+    if rank == 0:
+        target    = TargetClient(config["target_model"])
+        evaluator = EvaluatorClient(
+            api_key=config["groq_api_key"],
+            model_name=config["evaluator_model"]
+        )
 
     for round_idx in range(config["num_rounds"]):
 
-        rollouts = await collect_rollouts(
-            attacker, target, evaluator,
-            n=config["rollouts_per_round"],
-            max_concurrent=config["max_concurrent"]
-        )
+        # only rank 0 collects rollouts
+        if rank == 0:
+            rollouts = await collect_rollouts(
+                attacker, target, evaluator,
+                n=config["rollouts_per_round"],
+                max_concurrent=config["max_concurrent"]
+            )
+            if rollouts:
+                log_rollouts(rollouts, round_idx, config["output_path"])
+        else:
+            rollouts = []
 
-        if not rollouts:
+        # sync before training step — rank 1 waits here for rank 0
+        dist.barrier()
+
+        # broadcast whether we have rollouts
+        n_rollouts = torch.tensor(len(rollouts)).cuda(rank)
+        dist.broadcast(n_rollouts, src=0)
+
+        if n_rollouts.item() == 0:
             print(f"round {round_idx}: no successful rollouts, skipping")
             continue
 
-        if rank == 0:
-            log_rollouts(rollouts, round_idx, config["output_path"])
-
-        dist.barrier()
-
+        # both ranks participate in PPO update via FSDP
         trainer.step(rollouts)
 
         if rank == 0 and round_idx % config["log_every"] == 0:
@@ -104,11 +110,9 @@ async def training_loop(rank: int, world_size: int, config: dict):
         if os.path.exists(config["output_path"]):
             plot_collapse(config["output_path"])
         else:
-            print("No rollouts written — skipping plot")
+            print("no rollouts written — skipping plot")
 
     dist.destroy_process_group()
-
-# ── entry point ───────────────────────────────────────────────────────────────
 
 def _worker(rank: int, world_size: int, config: dict):
     asyncio.run(training_loop(rank, world_size, config))
@@ -116,10 +120,10 @@ def _worker(rank: int, world_size: int, config: dict):
 def main():
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"
-    
+
     config     = load_config()
-    world_size = torch.cuda.device_count() 
-    print(f"launching on {world_size} GPU")
+    world_size = torch.cuda.device_count()
+    print(f"launching on {world_size} GPUs")
 
     spawn(
         fn=_worker,

@@ -95,15 +95,26 @@ class FSDPTrainer:
         return pg_loss + self.beta * kl
 
     def step(self, rollouts: list[Rollout]):
-        """One PPO update step."""
+        torch.cuda.empty_cache()
+
+        # rank 1 has no rollouts — create dummy batch for FSDP sync
+        if not rollouts:
+            # still need to participate in FSDP collective ops
+            # run a minimal forward/backward with zeros
+            dummy = torch.zeros(1, 1, dtype=torch.long).cuda(self.rank)
+            output = self.model(dummy)
+            loss   = output.logits.sum() * 0.0  # zero loss, just for FSDP sync
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            return
+
         batch      = self._rollouts_to_batch(rollouts)
         advantages = batch.scores - batch.scores.mean()
 
         self.optimizer.zero_grad()
         new_logprobs = self._compute_new_logprobs(batch)
-        loss         = self._ppo_loss(
-            new_logprobs, batch.logprobs, advantages
-        )
+        loss         = self._ppo_loss(new_logprobs, batch.logprobs, advantages)
         loss.backward()
         self.optimizer.step()
 
