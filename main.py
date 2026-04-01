@@ -1,12 +1,12 @@
 """
 main.py — entry point for the red-teaming PPO pipeline.
 
-Architecture:
-  - Attacker: Qwen2.5-1.5B, FSDP across 2 GPUs, fine-tuned via PPO
-  - Target:   Groq API (free tier) — no local GPU needed
-  - Evaluator: Groq API (free tier) — scores compliance 0-1
-  - Generation: rank 0 only, via summon_full_params
-  - Training: both ranks, via FSDP
+Control flow per round:
+  1. Rank 0: generate prompts with gen_model (no FSDP, no collectives)
+  2. Rank 0: async Groq API calls (target + evaluator)
+  3. Rank 1: waits at barrier
+  4. Both ranks: barrier → step() (broadcast data, FSDP forward/backward)
+  5. Both ranks: sync gen_model weights (rank 0 only copies, no collective)
 """
 
 import asyncio
@@ -31,7 +31,7 @@ def load_config(path: str = "config.json") -> dict:
         "attacker_model": "Qwen/Qwen2.5-1.5B",
         "groq_api_key": "YOUR_GROQ_API_KEY",
         "target_model": "llama-3.1-8b-instant",
-        "evaluator_model": "llama-3.1-8b-instant",
+        "evaluator_model": "llama-3.3-70b-versatile",
         "num_rounds": 50,
         "rollouts_per_round": 8,
         "max_concurrent": 3,
@@ -78,14 +78,16 @@ def log_metrics(metrics: dict, round_idx: int):
 
 
 async def training_loop(rank: int, world_size: int, config: dict):
+    # ── init distributed ──
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
-    # all ranks load the attacker — FSDP shards across ranks
+    # both ranks load attacker — FSDP shards attacker.model across ranks
+    # gen_model stays separate, only used on rank 0
     attacker = AttackerModel(config["attacker_model"])
     trainer = FSDPTrainer(attacker, rank=rank)
 
-    # only rank 0 needs target + evaluator (Groq API clients)
+    # only rank 0 needs Groq API clients
     if rank == 0:
         target = TargetClient(
             api_key=config["groq_api_key"],
@@ -97,11 +99,16 @@ async def training_loop(rank: int, world_size: int, config: dict):
         )
 
     for round_idx in range(config["num_rounds"]):
-        # ── generation + API calls (rank 0 only, no collective ops) ──
+        if rank == 0:
+            print(f"\n── round {round_idx} ──")
+
+        # ── rank 0: generate + collect rollouts (no collective ops) ──
         if rank == 0:
             attacker_outputs = trainer.generate_rollout_inputs(
                 n=config["rollouts_per_round"]
             )
+            print(f"  generated {len(attacker_outputs)} prompts")
+
             rollouts = await collect_rollouts(
                 attacker_outputs,
                 target,
@@ -113,17 +120,17 @@ async def training_loop(rank: int, world_size: int, config: dict):
         else:
             rollouts = []
 
-        # ── PPO update (both ranks — broadcasts inside step() sync data) ──
+        # ── both ranks: sync then train ──
         dist.barrier()
         trainer.step(rollouts)
 
-        # ── logging ──
+        # ── rank 0: log metrics ──
         if rank == 0 and round_idx % config["log_every"] == 0 and rollouts:
             metrics = compute_metrics(rollouts)
             log_metrics(metrics, round_idx)
 
-    # ── final plot ──
-    if rank == 0 and os.path.exists(config["output_path"]):
+    # ── cleanup ──
+    if rank == 0 and os.path.exists(config.get("output_path", "")):
         plot_collapse(config["output_path"])
 
     dist.destroy_process_group()
@@ -140,10 +147,6 @@ def main():
     config = load_config()
     world_size = torch.cuda.device_count()
     print(f"launching on {world_size} GPUs")
-
-    if world_size < 2:
-        print("WARNING: need 2 GPUs for FSDP. falling back to 1 GPU.")
-        world_size = max(world_size, 1)
 
     spawn(
         fn=_worker,

@@ -1,11 +1,13 @@
 """
 attacker.py — HuggingFace causal LM as the attacker policy.
 
-Generates adversarial prompts, returns token IDs + log probs
-so PPO can recompute the ratio correctly.
+Two copies of the model:
+  - model: handed to FSDP for training (PPO forward/backward)
+  - gen_model: separate CPU copy for generation, synced after each step
+
+This avoids all FSDP-generation conflicts.
 """
 
-import asyncio
 import torch
 import torch.nn.functional as F
 from dataclasses import dataclass
@@ -20,43 +22,50 @@ SYSTEM_PROMPT = (
 @dataclass
 class AttackerOutput:
     prompt: str
-    generated_ids: torch.Tensor   # [seq_len] — token IDs of generated text
-    logprobs: torch.Tensor        # [seq_len] — log p(token_i | prefix)
+    generated_ids: torch.Tensor   # [seq_len]
+    logprobs: torch.Tensor        # [seq_len]
 
 
 class AttackerModel:
-    """
-    Wraps a HuggingFace causal LM for generation + log prob extraction.
-
-    IMPORTANT: after FSDP wraps self.model, generation must happen
-    inside summon_full_params(). The FSDPTrainer handles this.
-    """
-
     def __init__(self, model_name: str = "Qwen/Qwen2.5-1.5B"):
+        self.model_name = model_name
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        # this copy gets wrapped by FSDP for training
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            dtype=torch.bfloat16,
+            model_name, torch_dtype=torch.bfloat16,
         )
-        self.model.eval()
 
-        # cache the tokenized system prompt (doesn't change)
+        # gen_model loaded lazily on first generate call (only rank 0 needs it)
+        self.gen_model = None
+
+        # cache tokenized system prompt
         self._system_ids = self.tokenizer.encode(
             SYSTEM_PROMPT, return_tensors="pt"
         )  # [1, prompt_len]
 
+    def _ensure_gen_model(self):
+        """Lazy-load gen_model on first use (only rank 0 calls this)."""
+        if self.gen_model is None:
+            print("loading gen_model for generation...")
+            self.gen_model = AutoModelForCausalLM.from_pretrained(
+                self.model_name, torch_dtype=torch.bfloat16,
+            )
+            self.gen_model.eval()
+
     def generate_sync(self, device: torch.device) -> AttackerOutput:
         """
-        Generate one adversarial prompt. Must be called with the model
-        on `device` (either via summon_full_params or before FSDP wrap).
+        Generate one adversarial prompt using gen_model (NOT the FSDP model).
+        Moves gen_model to device, generates, moves back to CPU.
         """
+        self._ensure_gen_model()
+        self.gen_model.to(device)
         input_ids = self._system_ids.to(device)
 
         with torch.no_grad():
-            output = self.model.generate(
+            output = self.gen_model.generate(
                 input_ids,
                 max_new_tokens=64,
                 do_sample=True,
@@ -66,23 +75,36 @@ class AttackerModel:
             )
 
         prompt_len = input_ids.shape[1]
-        generated_ids = output.sequences[0, prompt_len:]  # [gen_len]
+        generated_ids = output.sequences[0, prompt_len:]
         prompt_text = self.tokenizer.decode(
             generated_ids, skip_special_tokens=True
         )
 
-        # extract log probs: scores is a tuple of [1, vocab] tensors
-        all_scores = torch.stack(output.scores, dim=0).squeeze(1)  # [gen_len, vocab]
+        all_scores = torch.stack(output.scores, dim=0).squeeze(1)
         log_probs = F.log_softmax(all_scores, dim=-1)
         token_logprobs = log_probs.gather(
             dim=-1, index=generated_ids.unsqueeze(-1)
-        ).squeeze(-1)  # [gen_len]
+        ).squeeze(-1)
 
-        return AttackerOutput(
+        result = AttackerOutput(
             prompt=prompt_text,
             generated_ids=generated_ids.cpu(),
             logprobs=token_logprobs.cpu(),
         )
+
+        # move gen_model back to CPU to free GPU memory for training
+        self.gen_model.cpu()
+        torch.cuda.empty_cache()
+
+        return result
+
+    def sync_gen_model(self, state_dict: dict):
+        """
+        Copy trained weights from FSDP model back to gen_model.
+        Called after each PPO step so next round generates with updated policy.
+        """
+        if self.gen_model is not None:
+            self.gen_model.load_state_dict(state_dict)
 
     def parameters(self):
         return self.model.parameters()
