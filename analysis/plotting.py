@@ -28,7 +28,8 @@ def load_metrics(rollouts_path: str) -> dict:
     for r in round_ids:
         rollouts = rounds[r]
         asr = sum(x["score"] > 0.5 for x in rollouts) / len(rollouts)
-        diversity = diversity_score([x["prompt"] for x in rollouts])
+        successful = [x["prompt"] for x in rollouts if x["score"] > 0.5]
+        diversity = diversity_score(successful) if len(successful) >= 2 else 0.0
         asrs.append(asr)
         diversities.append(diversity)
 
