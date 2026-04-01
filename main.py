@@ -3,10 +3,10 @@ main.py — entry point for the red-teaming PPO pipeline.
 
 Control flow per round:
   1. Rank 0: generate prompts with gen_model (no FSDP, no collectives)
-  2. Rank 0: async Groq API calls (target + evaluator)
+  2. Rank 0: async Groq target calls + heuristic scoring
   3. Rank 1: waits at barrier
   4. Both ranks: barrier → step() (broadcast data, FSDP forward/backward)
-  5. Both ranks: sync gen_model weights (rank 0 only copies, no collective)
+  5. Rank 0: sync gen_model weights (no collective)
 """
 
 import asyncio
@@ -19,7 +19,6 @@ from pathlib import Path
 
 from attacker import AttackerModel
 from target import TargetClient
-from evaluator import EvaluatorClient
 from rollout import collect_rollouts, Rollout
 from training.fsdp_trainer import FSDPTrainer
 from analysis.diversity import diversity_score
@@ -31,12 +30,14 @@ def load_config(path: str = "config.json") -> dict:
         "attacker_model": "Qwen/Qwen2.5-1.5B",
         "groq_api_key": "YOUR_GROQ_API_KEY",
         "target_model": "llama-3.1-8b-instant",
-        "evaluator_model": "llama-3.3-70b-versatile",
         "num_rounds": 50,
         "rollouts_per_round": 8,
         "max_concurrent": 3,
-        "log_every": 5,
+        "log_every": 1,
         "output_path": "data/rollouts.jsonl",
+        "lr": 1e-4,
+        "beta": 0.0,
+        "clip_eps": 0.3,
     }
     if Path(path).exists():
         with open(path) as f:
@@ -78,12 +79,9 @@ def log_metrics(metrics: dict, round_idx: int):
 
 
 async def training_loop(rank: int, world_size: int, config: dict):
-    # ── init distributed ──
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
-    # both ranks load attacker — FSDP shards attacker.model across ranks
-    # gen_model stays separate, only used on rank 0
     attacker = AttackerModel(config["attacker_model"])
     trainer = FSDPTrainer(
         attacker, rank=rank,
@@ -92,15 +90,11 @@ async def training_loop(rank: int, world_size: int, config: dict):
         beta=config.get("beta", 0.01),
     )
 
-    # only rank 0 needs Groq API clients
+    # only rank 0 needs the target API client
     if rank == 0:
         target = TargetClient(
             api_key=config["groq_api_key"],
             model_name=config["target_model"],
-        )
-        evaluator = EvaluatorClient(
-            api_key=config["groq_api_key"],
-            model_name=config["evaluator_model"],
         )
 
     for round_idx in range(config["num_rounds"]):
@@ -117,7 +111,6 @@ async def training_loop(rank: int, world_size: int, config: dict):
             rollouts = await collect_rollouts(
                 attacker_outputs,
                 target,
-                evaluator,
                 max_concurrent=config["max_concurrent"],
             )
             if rollouts:
