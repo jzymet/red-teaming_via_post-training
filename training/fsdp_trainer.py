@@ -2,9 +2,10 @@
 training/fsdp_trainer.py — FSDP-wrapped PPO trainer.
 
 Key design decisions:
-  - FULL_SHARD (ZeRO-3) across 2 GPUs
-  - summon_full_params() for generation on rank 0
-  - broadcast rollout data so both ranks do identical forward passes
+  - SHARD_GRAD_OP (ZeRO-2) across 2 GPUs — each rank keeps full params,
+    shards only gradients and optimizer states
+  - No summon_full_params needed — generation runs directly on rank 0
+  - Broadcast rollout data so both ranks do identical forward passes
   - PPO with clipped ratio + KL penalty
 """
 
@@ -42,10 +43,12 @@ class FSDPTrainer:
         self.beta = beta
         self.attacker = attacker
 
-        # FSDP wrap — moves model to GPU
+        # SHARD_GRAD_OP = ZeRO-2: full params on each rank, sharded grads + optim
+        # This means we can generate directly on the model without collective ops
+        # Memory: ~3GB params per rank for 1.5B model — fits fine on T4 (15.6GB)
         self.model = FSDP(
             attacker.model,
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
             device_id=torch.device(f"cuda:{rank}"),
         )
         self.tokenizer = attacker.tokenizer
@@ -56,21 +59,21 @@ class FSDPTrainer:
 
     def generate_rollout_inputs(self, n: int) -> list[AttackerOutput]:
         """
-        Generate n attacker outputs using the current policy.
+        Generate n attacker outputs on rank 0.
+        Only call this on rank 0 — no collective ops involved.
 
-        MUST be called on ALL ranks — summon_full_params is a collective
-        op (all-gather) that requires every rank to participate.
-        Only rank 0 actually generates; rank 1 just participates in
-        the collective and returns [].
+        With SHARD_GRAD_OP, full params are available on every rank,
+        so no all-gather / summon_full_params needed.
         """
         outputs = []
-        with FSDP.summon_full_params(self.model, writeback=False):
-            if self.rank == 0:
-                for _ in range(n):
-                    out = self.attacker.generate_sync(
-                        device=torch.device(f"cuda:{self.rank}")
-                    )
-                    outputs.append(out)
+        self.model.eval()
+        with torch.no_grad():
+            for _ in range(n):
+                out = self.attacker.generate_sync(
+                    device=torch.device(f"cuda:{self.rank}")
+                )
+                outputs.append(out)
+        self.model.train()
         return outputs
 
     def _broadcast_rollout_data(self, rollouts: list[Rollout]) -> PPOBatch:
@@ -100,24 +103,19 @@ class FSDPTrainer:
         dist.broadcast(max_gen_len, src=0)
         L = max_gen_len.item()
 
-        # pack tensors on rank 0, allocate on rank 1
-        if self.rank == 0:
-            gen_ids = torch.zeros(B, L, dtype=torch.long, device=f"cuda:{self.rank}")
-            gen_lens = torch.zeros(B, dtype=torch.long, device=f"cuda:{self.rank}")
-            old_lp = torch.zeros(B, L, dtype=torch.float32, device=f"cuda:{self.rank}")
-            scores = torch.zeros(B, dtype=torch.float32, device=f"cuda:{self.rank}")
+        # allocate tensors on both ranks, fill on rank 0
+        gen_ids = torch.zeros(B, L, dtype=torch.long, device=f"cuda:{self.rank}")
+        gen_lens = torch.zeros(B, dtype=torch.long, device=f"cuda:{self.rank}")
+        old_lp = torch.zeros(B, L, dtype=torch.float32, device=f"cuda:{self.rank}")
+        scores = torch.zeros(B, dtype=torch.float32, device=f"cuda:{self.rank}")
 
+        if self.rank == 0:
             for i, r in enumerate(rollouts):
                 gl = r.generated_ids.shape[0]
                 gen_ids[i, :gl] = r.generated_ids.to(f"cuda:{self.rank}")
                 gen_lens[i] = gl
                 old_lp[i, :gl] = r.logprobs.float().to(f"cuda:{self.rank}")
                 scores[i] = r.score
-        else:
-            gen_ids = torch.zeros(B, L, dtype=torch.long, device=f"cuda:{self.rank}")
-            gen_lens = torch.zeros(B, dtype=torch.long, device=f"cuda:{self.rank}")
-            old_lp = torch.zeros(B, L, dtype=torch.float32, device=f"cuda:{self.rank}")
-            scores = torch.zeros(B, dtype=torch.float32, device=f"cuda:{self.rank}")
 
         dist.broadcast(gen_ids, src=0)
         dist.broadcast(gen_lens, src=0)
@@ -144,26 +142,21 @@ class FSDPTrainer:
         L_sys = batch.system_ids.shape[1]
 
         # build input: [system_prompt | generated_tokens] for each sample
-        # system prompt is the same for all — expand and concat
         sys_expanded = batch.system_ids.expand(B, -1)  # [B, L_sys]
-        input_ids = torch.cat([sys_expanded, batch.generated_ids], dim=1)  # [B, L_sys + L_gen]
+        input_ids = torch.cat([sys_expanded, batch.generated_ids], dim=1)
 
-        # attention mask: system prompt is always attended, generated up to gen_length
+        # attention mask: system prompt always attended, generated up to gen_length
         attn_mask = torch.zeros_like(input_ids, dtype=torch.long)
         for i in range(B):
             gl = batch.gen_lengths[i].item()
             attn_mask[i, : L_sys + gl] = 1
 
         output = self.model(input_ids=input_ids, attention_mask=attn_mask)
-        # logits shape: [B, L_sys + L_gen, vocab]
 
-        # we want P(generated_token_t | system_prompt, generated_tokens_<t)
-        # logits at position (L_sys + t - 1) predict token at position (L_sys + t)
-        # so for generated tokens [0..L_gen-1], we need logits [L_sys-1..L_sys+L_gen-2]
-        gen_logits = output.logits[:, L_sys - 1 : L_sys + L_gen - 1, :]  # [B, L_gen, vocab]
+        # logits at position (L_sys + t - 1) predict token at (L_sys + t)
+        gen_logits = output.logits[:, L_sys - 1 : L_sys + L_gen - 1, :]
         log_probs = F.log_softmax(gen_logits, dim=-1)
 
-        # gather log probs for the actual generated tokens
         new_logprobs = log_probs.gather(
             dim=-1, index=batch.generated_ids.unsqueeze(-1)
         ).squeeze(-1)  # [B, L_gen]
@@ -176,15 +169,14 @@ class FSDPTrainer:
 
     def _ppo_loss(
         self,
-        new_logprobs: torch.Tensor,  # [B, L_gen]
-        old_logprobs: torch.Tensor,  # [B, L_gen]
-        advantages: torch.Tensor,    # [B]
-        gen_lengths: torch.Tensor,   # [B]
+        new_logprobs: torch.Tensor,
+        old_logprobs: torch.Tensor,
+        advantages: torch.Tensor,
+        gen_lengths: torch.Tensor,
     ) -> torch.Tensor:
         """Clipped PPO loss + KL penalty, operating on sequence-level log probs."""
-        # sum log probs over sequence (masking already applied)
-        new_seq = new_logprobs.sum(dim=-1)  # [B]
-        old_seq = old_logprobs.sum(dim=-1)  # [B]
+        new_seq = new_logprobs.sum(dim=-1)
+        old_seq = old_logprobs.sum(dim=-1)
 
         ratio = torch.exp(new_seq - old_seq)
         clipped = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
@@ -211,6 +203,7 @@ class FSDPTrainer:
 
         advantages = batch.scores - batch.scores.mean()
 
+        self.model.train()
         self.optimizer.zero_grad()
         new_logprobs = self._compute_new_logprobs(batch)
         loss = self._ppo_loss(

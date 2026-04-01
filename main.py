@@ -97,13 +97,11 @@ async def training_loop(rank: int, world_size: int, config: dict):
         )
 
     for round_idx in range(config["num_rounds"]):
-        # ── generation (ALL ranks enter summon_full_params) ──
-        attacker_outputs = trainer.generate_rollout_inputs(
-            n=config["rollouts_per_round"]
-        )
-
-        # ── async API calls (rank 0 only) ──
+        # ── generation + API calls (rank 0 only, no collective ops) ──
         if rank == 0:
+            attacker_outputs = trainer.generate_rollout_inputs(
+                n=config["rollouts_per_round"]
+            )
             rollouts = await collect_rollouts(
                 attacker_outputs,
                 target,
@@ -115,7 +113,7 @@ async def training_loop(rank: int, world_size: int, config: dict):
         else:
             rollouts = []
 
-        # ── PPO update (both ranks — data broadcast inside step()) ──
+        # ── PPO update (both ranks — broadcasts inside step() sync data) ──
         dist.barrier()
         trainer.step(rollouts)
 
