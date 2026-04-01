@@ -75,7 +75,7 @@ class AttackerModel:
         with torch.no_grad():
             output = self.gen_model.generate(
                 input_ids,
-                max_new_tokens=64,
+                max_new_tokens=32,
                 do_sample=True,
                 temperature=0.6,
                 return_dict_in_generate=True,
