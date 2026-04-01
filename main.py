@@ -85,7 +85,12 @@ async def training_loop(rank: int, world_size: int, config: dict):
     # both ranks load attacker — FSDP shards attacker.model across ranks
     # gen_model stays separate, only used on rank 0
     attacker = AttackerModel(config["attacker_model"])
-    trainer = FSDPTrainer(attacker, rank=rank)
+    trainer = FSDPTrainer(
+        attacker, rank=rank,
+        lr=config.get("lr", 1e-5),
+        clip_eps=config.get("clip_eps", 0.2),
+        beta=config.get("beta", 0.01),
+    )
 
     # only rank 0 needs Groq API clients
     if rank == 0:
